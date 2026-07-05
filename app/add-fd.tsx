@@ -11,14 +11,20 @@ import {
   ActivityIndicator,
   Modal,
   FlatList,
+  KeyboardAvoidingView,
+  Platform,
+  BackHandler,
 } from 'react-native';
+import { KeyboardAwareScrollView } from 'react-native-keyboard-aware-scroll-view';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter, useLocalSearchParams } from 'expo-router';
-import { ArrowLeft, Lock, Check, ChevronDown, Trophy, Plus } from 'lucide-react-native';
+import { ArrowLeft, Lock, Check, ChevronDown, Trophy, Plus, Calendar } from 'lucide-react-native';
 import { colors, radius, shadows, BANKS, COMPOUNDING_OPTIONS, INTEREST_PAYOUT_OPTIONS, typography } from '@/constants/theme';
 import { getDepositById, saveDeposit, getFamilyMembers, addFamilyMember, getCustomBanks, addCustomBank } from '@/lib/storage';
 import { calculateFDMaturity, formatCurrencyFull, formatMaturityDate } from '@/lib/calculations';
+import DatePickerModal from '@/components/DatePickerModal';
+import IOSSwitch from '@/components/IOSSwitch';
 
 function DropdownModal({
   visible, onClose, options, value, onSelect, title, onAddNew, addNewPlaceholder,
@@ -81,12 +87,14 @@ function DropdownModal({
 export default function AddFDScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { edit } = useLocalSearchParams<{ edit: string }>();
+  const { edit, prefill_principal, prefill_bank, prefill_member } = useLocalSearchParams<{ edit: string, prefill_principal?: string, prefill_bank?: string, prefill_member?: string }>();
   const [saving, setSaving] = useState(false);
-  const [loading, setLoading] = useState(!!edit);
+  const [loading, setLoading] = useState(true);
 
   const [name, setName] = useState('');
   const [startDate, setStartDate] = useState(() => new Date().toISOString().split('T')[0]);
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [showMaturityDatePicker, setShowMaturityDatePicker] = useState(false);
   const [bank, setBank] = useState('');
   const [familyMember, setFamilyMember] = useState('');
   const [principal, setPrincipal] = useState('');
@@ -104,7 +112,6 @@ export default function AddFDScreen() {
   // Manual input overrides
   const [manualMaturityAmount, setManualMaturityAmount] = useState('');
   const [manualMaturityDate, setManualMaturityDate] = useState('');
-  const [manualInterestEarned, setManualInterestEarned] = useState('');
 
   const [banksList, setBanksList] = useState<string[]>(BANKS);
   const [membersList, setMembersList] = useState<string[]>([]);
@@ -119,6 +126,58 @@ export default function AddFDScreen() {
   };
 
   const [errors, setErrors] = useState<Record<string, string>>({});
+
+  const currentStateStr = JSON.stringify({
+    name, startDate, bank, familyMember, principal, interestRate, tenureYears, tenureMonths, tenureDays, compounding, payout, autoCalculate, autoRenewal, accountRef, notes, manualMaturityAmount, manualMaturityDate
+  });
+  const [initialStateStr, setInitialStateStr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!loading && initialStateStr === null) {
+      setInitialStateStr(currentStateStr);
+    }
+  }, [loading, currentStateStr, initialStateStr]);
+
+  const hasUnsavedChanges = initialStateStr !== null && currentStateStr !== initialStateStr;
+
+  const handleBack = useCallback(() => {
+    if (hasUnsavedChanges && !saving) {
+      if (Platform.OS === 'web') {
+        const confirm = window.confirm('You have unsaved changes. Are you sure you want to discard them and leave?');
+        if (confirm) router.back();
+      } else {
+        Alert.alert(
+          'Discard changes?',
+          'You have unsaved changes. Are you sure you want to discard them and leave?',
+          [
+            { text: "Don't leave", style: 'cancel' },
+            {
+              text: 'Discard',
+              style: 'destructive',
+              onPress: () => router.back(),
+            },
+          ]
+        );
+      }
+      return true;
+    }
+    router.back();
+    return true; // Used for hardware back
+  }, [hasUnsavedChanges, saving, router]);
+
+  useEffect(() => {
+    if (Platform.OS === 'android') {
+      const onBackPress = () => {
+        if (hasUnsavedChanges && !saving) {
+          handleBack();
+          return true; // Prevent default
+        }
+        return false; // Let default happen
+      };
+      const subscription = BackHandler.addEventListener('hardwareBackPress', onBackPress);
+      return () => subscription.remove();
+    }
+  }, [hasUnsavedChanges, saving, handleBack]);
 
   const p = parseNumeric(principal);
   const r = parseNumeric(interestRate);
@@ -139,8 +198,20 @@ export default function AddFDScreen() {
       const dbCustomBanks = await getCustomBanks();
       setBanksList([...BANKS, ...dbCustomBanks]);
 
-      if (!edit && dbMembers.length > 0) {
-        setFamilyMember(dbMembers[0]);
+      if (!edit) {
+        if (dbMembers.length > 0) {
+          setFamilyMember(prefill_member || dbMembers[0]);
+        } else if (prefill_member) {
+          setFamilyMember(prefill_member);
+        }
+        
+        if (prefill_bank) {
+          setBank(prefill_bank);
+        }
+        
+        if (prefill_principal) {
+          setPrincipal(prefill_principal);
+        }
       }
 
       if (edit) {
@@ -167,43 +238,31 @@ export default function AddFDScreen() {
           if (d.maturity_date) {
             setManualMaturityDate(d.maturity_date);
           }
-          if (d.interest_earned !== null) {
-            setManualInterestEarned(d.interest_earned.toString());
-          }
 
-          // Check if calculations matched stored values to decide autoCalculate state
-          const calc = (d.principal_amount > 0 && d.interest_rate > 0 && (d.tenure_years + d.tenure_months + d.tenure_days > 0))
-            ? calculateFDMaturity(d.principal_amount, d.interest_rate, d.tenure_years, d.tenure_months, d.tenure_days, d.compounding_frequency, d.start_date)
-            : null;
-
-          if (!calc || Math.abs(calc.maturityAmount - (d.maturity_amount || 0)) > 1) {
+          // Check auto_calculate flag if it exists, otherwise fallback to heuristic
+          if (d.auto_calculate === false) {
             setAutoCalculate(false);
-          } else {
+          } else if (d.auto_calculate === true) {
             setAutoCalculate(true);
+          } else {
+            const calc = (d.principal_amount > 0 && d.interest_rate > 0 && (d.tenure_years + d.tenure_months + d.tenure_days > 0))
+              ? calculateFDMaturity(d.principal_amount, d.interest_rate, d.tenure_years, d.tenure_months, d.tenure_days, d.compounding_frequency, d.start_date)
+              : null;
+
+            if (!calc || Math.abs(calc.maturityAmount - (d.maturity_amount || 0)) > 1) {
+              setAutoCalculate(false);
+            } else {
+              setAutoCalculate(true);
+            }
           }
         }
-        setLoading(false);
       }
+      setLoading(false);
     };
     initData();
   }, [edit]);
 
-  // Pre-populate manual values when toggling autoCalculate off
-  useEffect(() => {
-    if (!autoCalculate) {
-      if (maturityCalc) {
-        if (!manualMaturityAmount) {
-          setManualMaturityAmount(maturityCalc.maturityAmount.toString());
-        }
-        if (!manualMaturityDate) {
-          setManualMaturityDate(maturityCalc.maturityDate.toISOString().split('T')[0]);
-        }
-        if (!manualInterestEarned) {
-          setManualInterestEarned(maturityCalc.interestEarned.toString());
-        }
-      }
-    }
-  }, [autoCalculate, maturityCalc]);
+
 
 
   const handleSave = async () => {
@@ -247,8 +306,7 @@ export default function AddFDScreen() {
         finalMaturityAmount = matAmt;
         finalMaturityDate = manualMaturityDate.trim();
 
-        const intEarned = parseFloat(manualInterestEarned);
-        finalInterestEarned = !isNaN(intEarned) ? intEarned : (matAmt - p);
+        finalInterestEarned = matAmt - p;
 
         if (r > 0) {
           finalEffectiveYield = r;
@@ -299,6 +357,7 @@ export default function AddFDScreen() {
         auto_renewal: autoRenewal,
         account_reference: accountRef || null,
         notes: notes || null,
+        auto_calculate: autoCalculate,
       });
       setSaving(false);
       if (edit) {
@@ -333,7 +392,7 @@ export default function AddFDScreen() {
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
       <View style={styles.header}>
-        <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
+        <TouchableOpacity style={styles.backBtn} onPress={handleBack}>
           <ArrowLeft size={20} color={colors.text1} />
         </TouchableOpacity>
         <View style={styles.headerCenter}>
@@ -343,28 +402,15 @@ export default function AddFDScreen() {
         <View style={{ width: 38 }} />
       </View>
 
-      <ScrollView contentContainerStyle={styles.form} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+      <KeyboardAwareScrollView 
+        contentContainerStyle={styles.form} 
+        showsVerticalScrollIndicator={false} 
+        keyboardShouldPersistTaps="handled"
+        enableOnAndroid={true}
+        extraScrollHeight={120}
+        extraHeight={120}
+      >
         <FormCard>
-          <FormField label="Deposit Name / Nickname">
-            <TextInput
-              style={styles.input}
-              placeholder="e.g. Tax Saving FD, Car Fund"
-              placeholderTextColor={colors.text4}
-              value={name}
-              onChangeText={setName}
-            />
-          </FormField>
-
-          <FormField label="Start Date" required>
-            <TextInput
-              style={styles.input}
-              placeholder="YYYY-MM-DD"
-              placeholderTextColor={colors.text4}
-              value={startDate}
-              onChangeText={setStartDate}
-            />
-          </FormField>
-
           <FormField label="Institution / Bank" required error={errors.bank}>
             <TouchableOpacity style={[styles.dropdown, errors.bank ? styles.inputError : null]} onPress={() => setBankDropdown(true)}>
               <Text style={[styles.dropdownText, !bank && styles.placeholderText]}>
@@ -379,6 +425,40 @@ export default function AddFDScreen() {
               <Text style={styles.dropdownText}>{familyMember}</Text>
               <ChevronDown size={16} color={colors.text4} />
             </TouchableOpacity>
+          </FormField>
+
+          <FormField label="Deposit Name / Nickname">
+            <TextInput
+              style={styles.input}
+              placeholder="e.g. Tax Saving FD, Car Fund"
+              placeholderTextColor={colors.text4}
+              value={name}
+              onChangeText={setName}
+            />
+          </FormField>
+
+          <FormField label="Start Date" required>
+            <View style={[styles.input, { flexDirection: 'row', alignItems: 'center', paddingRight: 8, height: 42, paddingVertical: 0 }]}>
+              <TextInput
+                style={{ flex: 1, fontSize: 14, color: colors.text1, height: '100%', outlineStyle: 'none' as any }}
+                placeholder="YYYY-MM-DD"
+                placeholderTextColor={colors.text4}
+                value={startDate}
+                onChangeText={setStartDate}
+              />
+              <TouchableOpacity onPress={() => setShowDatePicker(true)} style={{ padding: 4 }}>
+                <Calendar size={18} color="#000000" />
+              </TouchableOpacity>
+            </View>
+            <DatePickerModal
+              visible={showDatePicker}
+              currentDateStr={startDate}
+              onClose={() => setShowDatePicker(false)}
+              onSelect={(date) => {
+                setStartDate(date);
+                setShowDatePicker(false);
+              }}
+            />
           </FormField>
 
           <FormField label="Principal Amount" required error={errors.principal}>
@@ -397,16 +477,6 @@ export default function AddFDScreen() {
         </FormCard>
 
         <FormCard>
-          <View style={styles.toggleRow}>
-            <Text style={styles.toggleLabel}>Auto Calculate Maturity</Text>
-            <Switch
-              value={autoCalculate}
-              onValueChange={setAutoCalculate}
-              trackColor={{ false: colors.bgTertiary, true: '#22863a' }}
-              thumbColor={colors.white}
-              {...({ activeThumbColor: colors.white } as any)}
-            />
-          </View>
 
           <FormField label="Interest Rate (% p.a.)" required={autoCalculate} error={errors.interest}>
             <View style={[styles.suffixInput, errors.interest ? styles.inputError : null]}>
@@ -470,6 +540,21 @@ export default function AddFDScreen() {
           </FormField>
         </FormCard>
 
+        <View style={[styles.toggleRow, { backgroundColor: colors.bgElevated, padding: 16, borderRadius: radius.card, borderWidth: 1, borderColor: colors.separator, ...shadows.sm }]}>
+          <Text style={styles.toggleLabel}>Auto Calculate Maturity</Text>
+          <IOSSwitch
+            value={autoCalculate}
+            onValueChange={(val) => {
+              setAutoCalculate(val);
+              if (!val && maturityCalc) {
+                if (!manualMaturityAmount) setManualMaturityAmount(maturityCalc.maturityAmount.toString());
+                if (!manualMaturityDate) setManualMaturityDate(maturityCalc.maturityDate.toISOString().split('T')[0]);
+              }
+            }}
+            activeColor="#22863a"
+          />
+        </View>
+
         {!autoCalculate && (
           <FormCard>
             <FormField label="Maturity Amount" required error={errors.manualMaturityAmount}>
@@ -487,28 +572,31 @@ export default function AddFDScreen() {
             </FormField>
 
             <FormField label="Maturity Date" required error={errors.manualMaturityDate}>
-              <TextInput
-                style={[styles.input, errors.manualMaturityDate ? styles.inputError : null]}
-                placeholder="YYYY-MM-DD"
-                placeholderTextColor={colors.text4}
-                value={manualMaturityDate}
-                onChangeText={(val) => { setManualMaturityDate(val); setErrors(e => ({ ...e, manualMaturityDate: '' })); }}
+              <View style={[styles.input, errors.manualMaturityDate ? { borderColor: colors.error, borderWidth: 1 } : null, { flexDirection: 'row', alignItems: 'center', paddingRight: 8, height: 42, paddingVertical: 0 }]}>
+                <TextInput
+                  style={{ flex: 1, fontSize: 14, color: colors.text1, height: '100%', outlineStyle: 'none' as any }}
+                  placeholder="YYYY-MM-DD"
+                  placeholderTextColor={colors.text4}
+                  value={manualMaturityDate}
+                  onChangeText={(val) => { setManualMaturityDate(val); setErrors(e => ({ ...e, manualMaturityDate: '' })); }}
+                />
+                <TouchableOpacity onPress={() => setShowMaturityDatePicker(true)} style={{ padding: 4 }}>
+                  <Calendar size={18} color="#000000" />
+                </TouchableOpacity>
+              </View>
+              <DatePickerModal
+                visible={showMaturityDatePicker}
+                currentDateStr={manualMaturityDate || new Date().toISOString().split('T')[0]}
+                onClose={() => setShowMaturityDatePicker(false)}
+                onSelect={(date) => {
+                  setManualMaturityDate(date);
+                  setErrors(e => ({ ...e, manualMaturityDate: '' }));
+                  setShowMaturityDatePicker(false);
+                }}
               />
             </FormField>
 
-            <FormField label="Interest Earned (Optional)">
-              <View style={styles.currencyInput}>
-                <Text style={styles.currencySymbol}>₹</Text>
-                <TextInput
-                  style={[styles.input, { flex: 1, borderWidth: 0, paddingLeft: 0 }]}
-                  placeholder="Interest earned..."
-                  placeholderTextColor={colors.text4}
-                  value={manualInterestEarned}
-                  onChangeText={setManualInterestEarned}
-                  keyboardType="numeric"
-                />
-              </View>
-            </FormField>
+
           </FormCard>
         )}
 
@@ -563,12 +651,10 @@ export default function AddFDScreen() {
 
           <View style={styles.toggleRow}>
             <Text style={styles.toggleLabel}>Auto Renewal on Maturity</Text>
-            <Switch
+            <IOSSwitch
               value={autoRenewal}
               onValueChange={setAutoRenewal}
-              trackColor={{ false: colors.bgTertiary, true: '#22863a' }}
-              thumbColor={colors.white}
-              {...({ activeThumbColor: colors.white } as any)}
+              activeColor="#22863a"
             />
           </View>
 
@@ -584,7 +670,7 @@ export default function AddFDScreen() {
             />
           </FormField>
         </FormCard>
-      </ScrollView>
+      </KeyboardAwareScrollView>
 
       <View style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, 12) }]}>
         <TouchableOpacity style={styles.saveBtn} onPress={handleSave} disabled={saving}>

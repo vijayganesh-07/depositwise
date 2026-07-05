@@ -258,8 +258,9 @@ export default function HomeScreen() {
               </View>
               <Text style={styles.bentoTitle}>Fixed Deposit</Text>
               <Text style={styles.bentoSubtitle}>{activeFDs.length} active</Text>
-              <View style={styles.bentoArrow}>
-                <Plus size={16} color={colors.text1} strokeWidth={3} />
+              <View style={styles.bentoAddBtn}>
+                <Plus size={14} color={colors.text1} strokeWidth={3} />
+                <Text style={styles.bentoAddBtnText}>ADD</Text>
               </View>
             </TouchableOpacity>
 
@@ -273,8 +274,9 @@ export default function HomeScreen() {
               </View>
               <Text style={styles.bentoTitle}>Recurring Deposit</Text>
               <Text style={styles.bentoSubtitle}>{activeRDs.length} active</Text>
-              <View style={styles.bentoArrow}>
-                <Plus size={16} color={colors.text1} strokeWidth={3} />
+              <View style={styles.bentoAddBtn}>
+                <Plus size={14} color={colors.text1} strokeWidth={3} />
+                <Text style={styles.bentoAddBtnText}>ADD</Text>
               </View>
             </TouchableOpacity>
           </View>
@@ -661,15 +663,22 @@ const styles = StyleSheet.create({
     fontFamily: typography.medium,
     color: colors.text3,
   },
-  bentoArrow: {
+  bentoAddBtn: {
     marginTop: 8,
     alignSelf: 'flex-start',
-    width: 28,
-    height: 28,
-    borderRadius: radius.xs,
-    backgroundColor: colors.bgTertiary,
+    flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
+    gap: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: radius.pill,
+    backgroundColor: colors.bgTertiary,
+  },
+  bentoAddBtnText: {
+    fontSize: 11,
+    fontFamily: typography.bold,
+    color: colors.text1,
+    letterSpacing: 0.5,
   },
 
   // Deposit Cards

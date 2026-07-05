@@ -24,10 +24,12 @@ import {
   RefreshCw,
   FileText,
   Check,
+  RotateCcw,
 } from 'lucide-react-native';
 import { colors, radius, shadows, typography } from '@/constants/theme';
 import { getDepositById, deleteDeposit, saveDeposit, Deposit, RDPayment } from '@/lib/storage';
 import { formatCurrencyFull, formatMaturityDate, getMaturityLabel, getDaysUntilMaturity } from '@/lib/calculations';
+import DatePickerModal from '@/components/DatePickerModal';
 
 export default function DepositDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -37,6 +39,8 @@ export default function DepositDetailScreen() {
   const [loading, setLoading] = useState(true);
   const [deleting, setDeleting] = useState(false);
   const [updating, setUpdating] = useState(false);
+  const [editingPaymentMonth, setEditingPaymentMonth] = useState<number | null>(null);
+  const [pendingPaymentMonthToMarkPaid, setPendingPaymentMonthToMarkPaid] = useState<number | null>(null);
 
   useEffect(() => {
     getDepositById(id).then((data) => {
@@ -108,6 +112,26 @@ export default function DepositDetailScreen() {
     }
   };
 
+  const performUndoClose = async () => {
+    if (!deposit) return;
+    setUpdating(true);
+    try {
+      const updated = await saveDeposit({
+        ...deposit,
+        status: 'active',
+      });
+      setDeposit(updated);
+    } catch (error) {
+      if (Platform.OS === 'web') {
+        window.alert('Failed to undo close status. Please try again.');
+      } else {
+        Alert.alert('Error', 'Failed to undo close status. Please try again.');
+      }
+    } finally {
+      setUpdating(false);
+    }
+  };
+
   const handleCloseDeposit = () => {
     if (!deposit) return;
     if (Platform.OS === 'web') {
@@ -131,30 +155,73 @@ export default function DepositDetailScreen() {
     );
   };
 
+  const handleUndoClose = () => {
+    if (!deposit) return;
+    if (Platform.OS === 'web') {
+      const confirm = window.confirm(`Are you sure you want to reopen "${deposit.name}"?`);
+      if (confirm) {
+        performUndoClose();
+      }
+      return;
+    }
+    Alert.alert(
+      'Reopen Deposit',
+      `Are you sure you want to reopen "${deposit.name}"?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Confirm',
+          style: 'default',
+          onPress: performUndoClose,
+        },
+      ]
+    );
+  };
+
   const handleTogglePayment = async (monthNum: number) => {
     if (!deposit || !deposit.rd_payments) return;
+    
+    const payment = deposit.rd_payments.find(p => p.month === monthNum);
+    if (!payment) return;
 
+    if (payment.status === 'paid') {
+      // Toggle back to pending immediately
+      const updatedPayments = deposit.rd_payments.map(p => {
+        if (p.month === monthNum) {
+          return { ...p, status: 'pending', paid_date: null };
+        }
+        return p;
+      });
+      try {
+        const updated = await saveDeposit({
+          ...deposit,
+          rd_payments: updatedPayments,
+        });
+        setDeposit(updated);
+      } catch (err) {
+        console.error('Failed to toggle installment payment:', err);
+        Alert.alert('Error', 'Failed to update payment status.');
+      }
+    } else {
+      // It's pending, user wants to mark as paid. Open date picker.
+      setPendingPaymentMonthToMarkPaid(monthNum);
+    }
+  };
+
+  const handleUpdatePaymentDate = async (monthNum: number, newDate: string) => {
+    if (!deposit || !deposit.rd_payments) return;
     const updatedPayments = deposit.rd_payments.map(p => {
       if (p.month === monthNum) {
-        const isPaid = p.status === 'paid';
-        return {
-          ...p,
-          status: (isPaid ? 'pending' : 'paid') as 'paid' | 'pending',
-          paid_date: isPaid ? null : new Date().toISOString().split('T')[0],
-        };
+        return { ...p, paid_date: newDate };
       }
       return p;
     });
-
     try {
-      const updated = await saveDeposit({
-        ...deposit,
-        rd_payments: updatedPayments,
-      });
+      const updated = await saveDeposit({ ...deposit, rd_payments: updatedPayments });
       setDeposit(updated);
     } catch (err) {
-      console.error('Failed to toggle installment payment:', err);
-      Alert.alert('Error', 'Failed to update payment status.');
+      console.error('Failed to update payment date:', err);
+      Alert.alert('Error', 'Failed to update payment date.');
     }
   };
 
@@ -197,11 +264,48 @@ export default function DepositDetailScreen() {
     icon: colors.white,
   };
 
-  const tenure = [
+  let statusColor = colors.text2;
+  let statusBg = colors.bgTertiary;
+
+  if (isClosed) {
+    statusColor = '#b91c1c'; // red-700
+    statusBg = '#fee2e2'; // red-100
+  } else if (isMatured || isAboutToMature) {
+    statusColor = '#b45309'; // amber-700
+    statusBg = '#fef3c7'; // amber-100
+  } else {
+    // active
+    statusColor = '#15803d'; // green-700
+    statusBg = '#dcfce7'; // green-100
+  }
+
+  let tenure = [
     deposit.tenure_years > 0 ? `${deposit.tenure_years}Y` : '',
     deposit.tenure_months > 0 ? `${deposit.tenure_months}M` : '',
     deposit.tenure_days > 0 ? `${deposit.tenure_days}D` : '',
-  ].filter(Boolean).join(' ') || '—';
+  ].filter(Boolean).join(' ');
+
+  if (!tenure && deposit.start_date && deposit.maturity_date) {
+    const start = new Date(deposit.start_date);
+    const end = new Date(deposit.maturity_date);
+    let diffM = (end.getFullYear() - start.getFullYear()) * 12 + (end.getMonth() - start.getMonth());
+    let diffD = end.getDate() - start.getDate();
+    if (diffD < 0) {
+      diffM -= 1;
+      const prevMonth = new Date(end.getFullYear(), end.getMonth(), 0);
+      diffD += prevMonth.getDate();
+    }
+    const calcY = Math.floor(diffM / 12);
+    const calcM = diffM % 12;
+    
+    tenure = [
+      calcY > 0 ? `${calcY}Y` : '',
+      calcM > 0 ? `${calcM}M` : '',
+      diffD > 0 ? `${diffD}D` : '',
+    ].filter(Boolean).join(' ');
+  }
+
+  if (!tenure) tenure = '—';
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
@@ -244,8 +348,8 @@ export default function DepositDetailScreen() {
                 <View style={[styles.typeBadge, { backgroundColor: theme.soft }]}>
                   <Text style={[styles.typeBadgeText, { color: theme.text }]}>{deposit.type}</Text>
                 </View>
-                <View style={[styles.statusBadge, { backgroundColor: colors.bgTertiary }]}>
-                  <Text style={[styles.statusBadgeText, { color: colors.text2 }]}>{label}</Text>
+                <View style={[styles.statusBadge, { backgroundColor: statusBg }]}>
+                  <Text style={[styles.statusBadgeText, { color: statusColor }]}>{label}</Text>
                 </View>
               </View>
             </View>
@@ -370,9 +474,14 @@ export default function DepositDetailScreen() {
                             Due: {formatMaturityDate(p.due_date)}
                           </Text>
                           {p.paid_date && (
-                            <Text style={styles.paidDateText}>
-                              Paid on: {formatMaturityDate(p.paid_date)}
-                            </Text>
+                            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 1 }}>
+                              <Text style={[styles.paidDateText, { marginTop: 0 }]}>
+                                Paid on: {formatMaturityDate(p.paid_date)}
+                              </Text>
+                              <TouchableOpacity onPress={() => setEditingPaymentMonth(p.month)} hitSlop={{top: 10, bottom: 10, left: 10, right: 10}}>
+                                <Pencil size={11} color="#22863a" />
+                              </TouchableOpacity>
+                            </View>
                           )}
                         </View>
                       </View>
@@ -422,8 +531,23 @@ export default function DepositDetailScreen() {
 
       </ScrollView>
 
-      {deposit.status !== 'closed' && (
+      {deposit.status !== 'closed' ? (
         <View style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, 12) }]}>
+          {(isMatured || deposit.status === 'matured') && deposit.maturity_amount !== null && (
+            <TouchableOpacity
+              style={[styles.closeBtn, { backgroundColor: colors.mint, marginTop: 0, marginBottom: 12 }]}
+              onPress={() => {
+                router.push(`/add-fd?prefill_principal=${deposit.maturity_amount}&prefill_bank=${encodeURIComponent(deposit.bank)}&prefill_member=${encodeURIComponent(deposit.family_member_name)}` as any);
+              }}
+              disabled={updating}
+            >
+              <TrendingUp size={18} color={colors.text1} />
+              <Text style={[styles.closeBtnText, { color: colors.text1 }]}>
+                Reinvest as New FD
+              </Text>
+            </TouchableOpacity>
+          )}
+
           <TouchableOpacity
             style={[styles.closeBtn, { backgroundColor: colors.text1, marginTop: 0 }]}
             onPress={handleCloseDeposit}
@@ -441,6 +565,62 @@ export default function DepositDetailScreen() {
             )}
           </TouchableOpacity>
         </View>
+      ) : (
+        <View style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, 12) }]}>
+          <TouchableOpacity
+            style={[styles.closeBtn, { backgroundColor: '#b91c1c', marginTop: 0 }]}
+            onPress={handleUndoClose}
+            disabled={updating}
+          >
+            {updating ? (
+              <ActivityIndicator color={colors.white} />
+            ) : (
+              <>
+                <RotateCcw size={18} color={colors.white} />
+                <Text style={styles.closeBtnText}>Undo Closed Status</Text>
+              </>
+            )}
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {editingPaymentMonth !== null && deposit?.rd_payments && (
+        <DatePickerModal
+          visible={true}
+          currentDateStr={deposit.rd_payments.find(p => p.month === editingPaymentMonth)?.paid_date || new Date().toISOString().split('T')[0]}
+          onClose={() => setEditingPaymentMonth(null)}
+          onSelect={(date) => {
+            handleUpdatePaymentDate(editingPaymentMonth, date);
+            setEditingPaymentMonth(null);
+          }}
+        />
+      )}
+
+      {pendingPaymentMonthToMarkPaid !== null && (
+        <DatePickerModal
+          visible={true}
+          currentDateStr={new Date().toISOString().split('T')[0]}
+          onClose={() => setPendingPaymentMonthToMarkPaid(null)}
+          onSelect={async (date) => {
+            const monthNum = pendingPaymentMonthToMarkPaid;
+            setPendingPaymentMonthToMarkPaid(null);
+            
+            if (!deposit || !deposit.rd_payments) return;
+            const updatedPayments = deposit.rd_payments.map(p => {
+              if (p.month === monthNum) {
+                return { ...p, status: 'paid', paid_date: date };
+              }
+              return p;
+            });
+            try {
+              const updated = await saveDeposit({ ...deposit, rd_payments: updatedPayments });
+              setDeposit(updated);
+            } catch (err) {
+              console.error(err);
+              Alert.alert('Error', 'Failed to update payment status.');
+            }
+          }}
+        />
       )}
     </View>
   );

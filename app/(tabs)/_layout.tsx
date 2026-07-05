@@ -1,7 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Tabs, useRouter } from 'expo-router';
-import { View, Text, TouchableOpacity, StyleSheet, Platform, Alert, ActivityIndicator, DeviceEventEmitter } from 'react-native';
-import { Home, Building2, BarChart3, Settings, TrendingUp } from 'lucide-react-native';
+import { View, Text, TouchableOpacity, StyleSheet, Platform, Alert, ActivityIndicator, DeviceEventEmitter, AppState, AppStateStatus } from 'react-native';
+import { Home, Building2, BarChart3, Settings, TrendingUp, Fingerprint } from 'lucide-react-native';
 import { colors, radius, typography, shadows } from '@/constants/theme';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as WebBrowser from 'expo-web-browser';
@@ -9,6 +9,8 @@ import * as Linking from 'expo-linking';
 import Svg, { Path } from 'react-native-svg';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getGoogleClientId, isAuthenticated, fetchAndSaveUserProfile, restoreFromGoogleDrive } from '@/lib/storage';
+import { isAppLockEnabled, authenticate } from '@/lib/appLock';
+import '@/lib/notifications';
 
 const TABS = [
   { name: 'index', label: 'Home', Icon: Home },
@@ -128,16 +130,37 @@ function OnboardingScreen({ onSignInSuccess }: { onSignInSuccess: () => void }) 
       window.location.href = authUrl;
       return;
     }
-    // On Android: use native Google Sign-In via AuthSession
+    // On Android: use native Google Sign-In
     if (!clientId) {
       Alert.alert('Configuration Missing', 'Please set up a valid Google Client ID in Settings first.');
       return;
     }
     setSigningIn(true);
     try {
-      await promptAsync();
-    } catch (e) {
+      const { configureGoogleSignIn, signIn } = await import('@/lib/driveSync');
+      const { GoogleSignin } = await import('@react-native-google-signin/google-signin');
+      configureGoogleSignIn(clientId);
+      const userInfo = await signIn();
+      if (userInfo) {
+        const { accessToken } = await GoogleSignin.getTokens();
+        if (accessToken) {
+          await AsyncStorage.setItem('google_access_token', accessToken);
+          await fetchAndSaveUserProfile(accessToken);
+          try {
+            await restoreFromGoogleDrive(accessToken);
+          } catch (restoreErr) {
+            console.log('No backup found or restore failed. Starting fresh:', restoreErr);
+            const { clearAllData } = await import('@/lib/storage');
+            await clearAllData();
+          }
+          DeviceEventEmitter.emit('deposits_changed');
+          onSignInSuccess();
+        }
+      }
+    } catch (e: any) {
       console.error(e);
+      Alert.alert('Sign-In Error', e.message || 'Could not sign in to Google.');
+    } finally {
       setSigningIn(false);
     }
   };
@@ -249,11 +272,62 @@ function CustomTabBar({ state, navigation, authenticated, onSignInPrompt }: any)
 
 export default function TabLayout() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  const [locked, setLocked] = useState(false);
+  const [authInProgress, setAuthInProgress] = useState(false);
+  const router = useRouter();
+  const appState = useRef<AppStateStatus>(AppState.currentState);
 
   const checkAuth = async () => {
     const auth = await isAuthenticated();
     setAuthenticated(auth);
   };
+
+  // Attempt biometric unlock
+  const handleUnlock = async () => {
+    if (authInProgress) return;
+    setAuthInProgress(true);
+    const success = await authenticate();
+    setAuthInProgress(false);
+    if (success) {
+      setLocked(false);
+    } else {
+      Alert.alert('Authentication Failed', 'Please try again to unlock DepositWise.');
+    }
+  };
+
+  // Check app lock on initial mount
+  useEffect(() => {
+    if (Platform.OS === 'web') return;
+    isAppLockEnabled().then(enabled => {
+      if (enabled) {
+        setLocked(true);
+        // Auto-prompt immediately
+        authenticate().then(success => {
+          if (success) setLocked(false);
+        });
+      }
+    });
+  }, []);
+
+  // Re-lock whenever app comes back from background
+  useEffect(() => {
+    if (Platform.OS === 'web') return;
+    const subscription = AppState.addEventListener('change', async (nextState: AppStateStatus) => {
+      const wasBackground =
+        appState.current === 'background' && nextState === 'active';
+      appState.current = nextState;
+
+      if (wasBackground) {
+        const lockEnabled = await isAppLockEnabled();
+        if (lockEnabled) {
+          setLocked(true);
+          const success = await authenticate();
+          if (success) setLocked(false);
+        }
+      }
+    });
+    return () => subscription.remove();
+  }, []);
 
   useEffect(() => {
     checkAuth();
@@ -291,7 +365,38 @@ export default function TabLayout() {
 
       {authenticated === false && (
         <View style={[StyleSheet.absoluteFillObject, { zIndex: 1000 }]}>
-          <OnboardingScreen onSignInSuccess={() => setAuthenticated(true)} />
+          <OnboardingScreen onSignInSuccess={() => {
+            setAuthenticated(true);
+            router.replace('/');
+          }} />
+        </View>
+      )}
+
+      {/* App Lock overlay — sits above everything including onboarding */}
+      {locked && Platform.OS !== 'web' && (
+        <View style={[StyleSheet.absoluteFillObject, lockStyles.overlay]}>
+          <View style={lockStyles.card}>
+            <View style={lockStyles.iconWrap}>
+              <Fingerprint size={40} color={colors.text1} strokeWidth={1.5} />
+            </View>
+            <Text style={lockStyles.title}>DepositWise</Text>
+            <Text style={lockStyles.subtitle}>Locked for your privacy</Text>
+            <TouchableOpacity
+              style={lockStyles.unlockBtn}
+              onPress={handleUnlock}
+              activeOpacity={0.85}
+              disabled={authInProgress}
+            >
+              {authInProgress ? (
+                <ActivityIndicator color={colors.mint} size="small" />
+              ) : (
+                <>
+                  <Fingerprint size={20} color={colors.mint} />
+                  <Text style={lockStyles.unlockText}>Unlock with Biometrics</Text>
+                </>
+              )}
+            </TouchableOpacity>
+          </View>
         </View>
       )}
     </View>
@@ -445,3 +550,67 @@ const styles = StyleSheet.create({
     fontSize: 15,
   },
 });
+
+const lockStyles = StyleSheet.create({
+  overlay: {
+    backgroundColor: colors.bgBase,
+    zIndex: 2000,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 32,
+  },
+  card: {
+    width: '100%',
+    maxWidth: 340,
+    backgroundColor: colors.bgElevated,
+    borderRadius: radius.bento,
+    padding: 36,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: colors.separator,
+    ...shadows.md,
+  },
+  iconWrap: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: colors.mint,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 24,
+    borderWidth: 1,
+    borderColor: colors.mintDim,
+  },
+  title: {
+    fontSize: 24,
+    fontFamily: typography.bold,
+    color: colors.text1,
+    letterSpacing: -0.5,
+    marginBottom: 8,
+  },
+  subtitle: {
+    fontSize: 14,
+    fontFamily: typography.regular,
+    color: colors.text3,
+    marginBottom: 36,
+    textAlign: 'center',
+  },
+  unlockBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    backgroundColor: colors.text1,
+    borderRadius: radius.sm,
+    paddingVertical: 16,
+    paddingHorizontal: 28,
+    width: '100%',
+  },
+  unlockText: {
+    color: colors.mint,
+    fontSize: 16,
+    fontFamily: typography.bold,
+    letterSpacing: -0.2,
+  },
+});
+

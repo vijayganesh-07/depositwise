@@ -30,8 +30,8 @@ export function calculateFDMaturity(
     const fallback = new Date();
     fallback.setMonth(fallback.getMonth() + Math.round(totalMonths));
     return {
-      maturityAmount: Math.round(maturityAmount),
-      interestEarned: Math.round(interestEarned),
+      maturityAmount: Math.round(maturityAmount * 100) / 100,
+      interestEarned: Math.round(interestEarned * 100) / 100,
       effectiveYield: Math.round(effectiveYield * 100) / 100,
       maturityDate: fallback,
     };
@@ -42,8 +42,8 @@ export function calculateFDMaturity(
   maturityDate.setDate(maturityDate.getDate() + tenureDays);
 
   return {
-    maturityAmount: Math.round(maturityAmount),
-    interestEarned: Math.round(interestEarned),
+    maturityAmount: Math.round(maturityAmount * 100) / 100,
+    interestEarned: Math.round(interestEarned * 100) / 100,
     effectiveYield: Math.round(effectiveYield * 100) / 100,
     maturityDate,
   };
@@ -84,8 +84,8 @@ export function calculateRDMaturity(
     const fallback = new Date();
     fallback.setMonth(fallback.getMonth() + tenureMonths);
     return {
-      maturityAmount: Math.round(maturityAmount),
-      interestEarned: Math.round(interestEarned),
+      maturityAmount: Math.round(maturityAmount * 100) / 100,
+      interestEarned: Math.round(interestEarned * 100) / 100,
       effectiveYield: Math.round(effectiveYield * 100) / 100,
       maturityDate: fallback,
     };
@@ -94,8 +94,8 @@ export function calculateRDMaturity(
   maturityDate.setMonth(startDate.getMonth() + tenureMonths);
 
   return {
-    maturityAmount: Math.round(maturityAmount),
-    interestEarned: Math.round(interestEarned),
+    maturityAmount: Math.round(maturityAmount * 100) / 100,
+    interestEarned: Math.round(interestEarned * 100) / 100,
     effectiveYield: Math.round(effectiveYield * 100) / 100,
     maturityDate,
   };
@@ -109,7 +109,7 @@ export function formatCurrency(amount: number): string {
 }
 
 export function formatCurrencyFull(amount: number): string {
-  return `₹${amount.toLocaleString('en-IN')}`;
+  return `₹${amount.toLocaleString('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
 }
 
 export function getDaysUntilMaturity(maturityDate: string | null): number | null {
@@ -123,7 +123,7 @@ export function getDaysUntilMaturity(maturityDate: string | null): number | null
 export function formatMaturityDate(dateStr: string | null): string {
   if (!dateStr) return '-';
   const d = new Date(dateStr);
-  return d.toLocaleDateString('en-IN', { month: 'short', year: 'numeric' });
+  return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
 export function getMaturityLabel(maturityDate: string | null, status: string): string {

@@ -20,7 +20,6 @@ export async function signIn() {
 
 export async function signOut() {
   try {
-    await GoogleSignin.revokeAccess();
     await GoogleSignin.signOut();
   } catch (error) {
     console.error('Error signing out', error);

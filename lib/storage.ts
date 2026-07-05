@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform, DeviceEventEmitter } from 'react-native';
+import { syncNotifications } from './notifications';
 
 export type RDPayment = {
   month: number;
@@ -31,6 +32,7 @@ export interface Deposit {
   auto_renewal: boolean;
   account_reference: string | null;
   notes: string | null;
+  auto_calculate?: boolean;
   created_at: string;
   updated_at: string;
   rd_payments?: RDPayment[] | null;
@@ -44,6 +46,7 @@ const STORAGE_KEYS = {
   FAMILY_MEMBERS: 'fd_vault_family_members',
   CUSTOM_BANKS: 'fd_vault_custom_banks',
   GOOGLE_CLIENT_ID: 'fd_vault_google_client_id',
+  NOTIFICATION_TOGGLES: 'fd_vault_notification_toggles',
 };
 
 // Seed sample family members
@@ -337,6 +340,12 @@ export async function saveDeposit(deposit: Partial<Deposit> & { type: 'FD' | 'RD
   await writeKey(STORAGE_KEYS.DEPOSITS, list);
   DeviceEventEmitter.emit('deposits_changed');
   triggerAutoBackup();
+
+  // Sync notifications after saving
+  getNotificationToggles().then(toggles => {
+    syncNotifications(list, toggles);
+  });
+
   return savedDeposit;
 }
 
@@ -353,6 +362,11 @@ export async function deleteDeposit(id: string): Promise<void> {
     await writeKey(STORAGE_KEYS.DEPOSITS, list);
     DeviceEventEmitter.emit('deposits_changed');
     triggerAutoBackup();
+
+    // Sync notifications after deleting
+    getNotificationToggles().then(toggles => {
+      syncNotifications(list, toggles);
+    });
   }
 }
 
@@ -563,8 +577,14 @@ export async function isAuthenticated(): Promise<boolean> {
   }
   try {
     const { GoogleSignin } = await import('@react-native-google-signin/google-signin');
+    const { configureGoogleSignIn } = await import('@/lib/driveSync');
+    const clientId = await getGoogleClientId();
+    if (clientId) {
+      configureGoogleSignIn(clientId);
+    }
     return GoogleSignin.hasPreviousSignIn();
-  } catch {
+  } catch (error) {
+    console.error("Auth check error:", error);
     return false;
   }
 }
@@ -670,5 +690,25 @@ export async function restoreFromGoogleDrive(token: string): Promise<void> {
   const backup = await fileRes.json();
   await importBackupData(backup);
   DeviceEventEmitter.emit('deposits_changed');
+}
+
+export async function getNotificationToggles(): Promise<{ maturityReminders: boolean; rdInstallmentReminders: boolean }> {
+  try {
+    const data = await AsyncStorage.getItem(STORAGE_KEYS.NOTIFICATION_TOGGLES);
+    if (data) {
+      return JSON.parse(data);
+    }
+  } catch (e) {
+    console.error('Failed to get notification toggles:', e);
+  }
+  return { maturityReminders: false, rdInstallmentReminders: false };
+}
+
+export async function setNotificationToggles(toggles: { maturityReminders: boolean; rdInstallmentReminders: boolean }): Promise<void> {
+  try {
+    await AsyncStorage.setItem(STORAGE_KEYS.NOTIFICATION_TOGGLES, JSON.stringify(toggles));
+  } catch (e) {
+    console.error('Failed to save notification toggles:', e);
+  }
 }
 

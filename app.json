@@ -8,11 +8,21 @@
     "scheme": "depositwise",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/images/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#1a1830"
+    },
     "ios": {
       "supportsTablet": true
     },
     "android": {
-      "package": "com.depositwise.app"
+      "package": "com.depositwise.app",
+      "jsEngine": "hermes",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "backgroundColor": "#eef1f4"
+      }
     },
     "web": {
       "bundler": "metro",
@@ -23,7 +33,10 @@
       "expo-router",
       "expo-font",
       "expo-web-browser",
-      "@react-native-google-signin/google-signin"
+      "expo-local-authentication",
+      "@react-native-google-signin/google-signin",
+      "@react-native-community/datetimepicker",
+      "./plugins/withAndroidApkSplits.js"
     ],
     "experiments": {
       "typedRoutes": true

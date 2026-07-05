@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { useFocusEffect } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import {
   View,
   Text,
@@ -40,8 +40,14 @@ import {
   signOutLocally,
   UserProfile,
   isAuthenticated,
+  getNotificationToggles,
+  setNotificationToggles,
+  getAllDepositsIncludingDeleted,
 } from '@/lib/storage';
 import { signIn, syncWithGoogleDrive, configureGoogleSignIn } from '@/lib/driveSync';
+import { syncNotifications, requestNotificationPermissions } from '@/lib/notifications';
+import IOSSwitch from '@/components/IOSSwitch';
+import { isAppLockEnabled, setAppLockEnabled, isBiometricAvailable } from '@/lib/appLock';
 
 type SettingToggle = {
   maturityReminders: boolean;
@@ -51,11 +57,22 @@ type SettingToggle = {
 
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
+  const router = useRouter();
   const [toggles, setToggles] = useState<SettingToggle>({
     maturityReminders: true,
     rdInstallmentReminders: true,
     appLock: false,
   });
+
+  // Load persisted app lock state and notification toggles
+  useEffect(() => {
+    isAppLockEnabled().then(enabled => {
+      setToggles(prev => ({ ...prev, appLock: enabled }));
+    });
+    getNotificationToggles().then(notifToggles => {
+      setToggles(prev => ({ ...prev, ...notifToggles }));
+    });
+  }, []);
 
   const [backingUp, setBackingUp] = useState(false);
   const [restoring, setRestoring] = useState(false);
@@ -84,6 +101,7 @@ export default function SettingsScreen() {
         signOutLocally().then(() => {
           setUserProfile(null);
           setIsSignedIn(false);
+          router.replace('/');
         });
       }
     } else {
@@ -99,6 +117,7 @@ export default function SettingsScreen() {
               await signOutLocally();
               setUserProfile(null);
               setIsSignedIn(false);
+              router.replace('/');
             },
           },
         ]
@@ -108,7 +127,7 @@ export default function SettingsScreen() {
 
   const handleClearData = () => {
     const message = 'Are you sure you want to delete all your deposits, custom banks, and family members? This action is permanent and cannot be undone unless you have a Google Drive backup.';
-    
+
     if (Platform.OS === 'web') {
       const confirmClear = window.confirm(message);
       if (confirmClear) {
@@ -137,8 +156,50 @@ export default function SettingsScreen() {
     }
   };
 
-  const toggle = (key: keyof SettingToggle) => {
-    setToggles(prev => ({ ...prev, [key]: !prev[key] }));
+  const toggle = async (key: 'maturityReminders' | 'rdInstallmentReminders') => {
+    const newVal = !toggles[key];
+    const newToggles = { ...toggles, [key]: newVal };
+    setToggles(newToggles);
+    await setNotificationToggles({
+      maturityReminders: newToggles.maturityReminders,
+      rdInstallmentReminders: newToggles.rdInstallmentReminders,
+    });
+
+    if (newVal) {
+      const hasPermission = await requestNotificationPermissions();
+      if (!hasPermission) {
+        Alert.alert('Permission Required', 'Please enable notifications in your device settings.');
+      }
+    }
+
+    const deposits = await getAllDepositsIncludingDeleted();
+    await syncNotifications(deposits, newToggles);
+  };
+
+  const handleAppLockToggle = async () => {
+    if (Platform.OS === 'web') {
+      Alert.alert('Not Supported', 'App Lock is only available on Android.');
+      return;
+    }
+    const currentlyEnabled = toggles.appLock;
+    if (!currentlyEnabled) {
+      // Turning ON — check device capability first
+      const available = await isBiometricAvailable();
+      if (!available) {
+        Alert.alert(
+          'Not Available',
+          'No biometrics or device PIN found. Please set up fingerprint, face unlock, or a screen lock PIN in your device settings first.',
+          [{ text: 'OK' }]
+        );
+        return;
+      }
+    }
+    const newValue = !currentlyEnabled;
+    await setAppLockEnabled(newValue);
+    setToggles(prev => ({ ...prev, appLock: newValue }));
+    if (newValue) {
+      Alert.alert('App Lock Enabled', 'DepositWise will require biometric or PIN authentication each time you open the app.');
+    }
   };
 
   const [clientId, setClientId] = useState('');
@@ -178,6 +239,7 @@ export default function SettingsScreen() {
       if (userInfo) {
         setIsSignedIn(true);
         Alert.alert('Signed In', `Welcome! Your data will now automatically back up in the background.`);
+        router.replace('/');
       }
     } catch (error: any) {
       Alert.alert('Sign-In Error', error.message || 'Could not sign in to Google.');
@@ -231,7 +293,7 @@ export default function SettingsScreen() {
       const { getDeposits } = await import('@/lib/storage');
       const list = await getDeposits();
       const active = list.filter(d => d.status !== 'closed');
-      
+
       if (active.length === 0) {
         Alert.alert('No Data', 'You do not have any active deposits to export.');
         return;
@@ -275,7 +337,7 @@ export default function SettingsScreen() {
       const { getDeposits } = await import('@/lib/storage');
       const list = await getDeposits();
       const active = list.filter(d => d.status !== 'closed');
-      
+
       if (active.length === 0) {
         Alert.alert('No Data', 'You do not have any active deposits to export.');
         return;
@@ -284,15 +346,18 @@ export default function SettingsScreen() {
       const totalInvested = active.reduce((sum, d) => sum + d.principal_amount, 0);
       const totalMaturity = active.reduce((sum, d) => sum + (d.maturity_amount || d.principal_amount), 0);
       const totalInterest = totalMaturity - totalInvested;
+      const overallGainPct = totalInvested > 0 ? ((totalInterest / totalInvested) * 100).toFixed(1) : '0.0';
 
-      const blendedYield = totalInvested > 0 
+      const blendedYield = totalInvested > 0
         ? active.reduce((sum, d) => sum + (d.principal_amount * d.interest_rate), 0) / totalInvested
         : 0;
-        
+
       const totalRDMonthly = active
         .filter(d => d.type === 'RD' && d.tenure_months > 0)
         .reduce((sum, d) => sum + (d.principal_amount / d.tenure_months), 0);
 
+      const fdCount = active.filter(d => d.type === 'FD').length;
+      const rdCount = active.filter(d => d.type === 'RD').length;
       const fdValue = active.filter(d => d.type === 'FD').reduce((s, d) => s + (d.maturity_amount || d.principal_amount), 0);
       const rdValue = active.filter(d => d.type === 'RD').reduce((s, d) => s + (d.maturity_amount || d.principal_amount), 0);
 
@@ -304,159 +369,265 @@ export default function SettingsScreen() {
         familyMap[d.family_member_name] = (familyMap[d.family_member_name] || 0) + val;
       });
 
-      const html = `
-        <html>
-          <head>
-            <title>DepositWise Portfolio Report</title>
-            <style>
-              body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; padding: 40px; color: #0E0F0C; background: #F4F2EC; }
-              @media print {
-                @page { margin: 15mm; }
-                body { background: #FFFFFF; padding: 0; }
-                .page-break { page-break-before: always; margin-top: 40px; }
-              }
-              h1 { margin-bottom: 5px; color: #0E0F0C; }
-              h2 { margin-top: 40px; margin-bottom: 15px; font-size: 20px; color: #0E0F0C; border-bottom: 2px solid #EBE8E0; padding-bottom: 8px; }
-              h3 { margin-top: 0; margin-bottom: 15px; font-size: 16px; color: #0E0F0C; }
-              .date { color: #8A8A82; font-size: 14px; margin-bottom: 30px; }
-              .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 30px; }
-              .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-bottom: 30px; }
-              .card { padding: 20px; background: #fff; border-radius: 16px; border: 1px solid #EBE8E0; }
-              .card-label { font-size: 12px; color: #8A8A82; font-weight: 600; text-transform: uppercase; margin-bottom: 5px; letter-spacing: 0.5px; }
-              .card-value { font-size: 24px; font-weight: 800; color: #0E0F0C; }
-              .card-value.green { color: #22863a; }
-              .card-value.lime { color: #0E0F0C; background: #D7FE47; display: inline-block; padding: 2px 8px; border-radius: 6px; }
-              .list-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px dashed #EBE8E0; font-size: 14px; }
-              .list-item:last-child { border-bottom: none; padding-bottom: 0; }
-              table { width: 100%; border-collapse: collapse; margin-top: 20px; background: #fff; border-radius: 12px; overflow: hidden; border: 1px solid #EBE8E0; }
-              th { background: #0E0F0C; color: #fff; text-align: left; padding: 12px; font-weight: 600; font-size: 13px; }
-              td { padding: 12px; border-bottom: 1px solid #EBE8E0; font-size: 13px; }
-              .badge { padding: 4px 8px; border-radius: 20px; font-size: 11px; font-weight: 700; display: inline-block; }
-              .badge.fd { background: #22863a; color: #fff; }
-              .badge.rd { background: #FF5A1F; color: #fff; }
-              .muted { color: #8A8A82; font-size: 11px; display: block; margin-top: 3px; }
-            </style>
-          </head>
-          <body>
-            <h1>DepositWise Portfolio Report</h1>
-            <div class="date">Generated on ${new Date().toLocaleDateString('en-IN', { dateStyle: 'long' })}</div>
-            
-            <h2>1. Portfolio Analytics</h2>
-            
-            <div class="grid">
-              <div class="card">
-                <div class="card-label">Total Invested</div>
-                <div class="card-value">₹${totalInvested.toLocaleString('en-IN')}</div>
-              </div>
-              <div class="card">
-                <div class="card-label">Estimated Interest</div>
-                <div class="card-value green">₹${totalInterest.toLocaleString('en-IN')}</div>
-              </div>
-              <div class="card">
-                <div class="card-label">Portfolio Value</div>
-                <div class="card-value lime">₹${totalMaturity.toLocaleString('en-IN')}</div>
-              </div>
-            </div>
+      const bankEntries = Object.entries(bankMap).sort((a, b) => b[1] - a[1]);
+      const familyEntries = Object.entries(familyMap).sort((a, b) => b[1] - a[1]);
+      const CHART_COLORS = ['#FF5A1F','#8b5cf6','#f43f5e','#0ea5e9','#f59e0b','#ec4899','#6366f1','#10b981'];
 
-            <div class="grid">
-              <div class="card">
-                <div class="card-label">Blended Yield</div>
-                <div class="card-value">${blendedYield.toFixed(2)}% <span style="font-size:12px; font-weight:400; color:#8A8A82">p.a.</span></div>
-              </div>
-              <div class="card">
-                <div class="card-label">RD Monthly Flow</div>
-                <div class="card-value">₹${totalRDMonthly.toLocaleString('en-IN')}</div>
-              </div>
-              <div class="card">
-                <div class="card-label">Total Deposits</div>
-                <div class="card-value">${active.length}</div>
-              </div>
-            </div>
+      const fmt = (n: number) => '₹' + Math.round(n).toLocaleString('en-IN');
 
-            <div class="grid-2">
-              <div class="card">
-                <h3>Product Mix</h3>
-                <div class="list-item">
-                  <span>Fixed Deposits</span>
-                  <strong>₹${fdValue.toLocaleString('en-IN')}</strong>
-                </div>
-                <div class="list-item">
-                  <span>Recurring Deposits</span>
-                  <strong>₹${rdValue.toLocaleString('en-IN')}</strong>
-                </div>
+      const barRow = (label: string, value: number, total: number, color: string, sub?: string, badgeHtml?: string) => {
+        const pct = total > 0 ? Math.round((value / total) * 100) : 0;
+        return `
+          <div class="bar-item" style="display:flex; align-items:flex-start; gap:12px;">
+            ${badgeHtml ? badgeHtml : ''}
+            <div style="flex:1;">
+              <div class="bar-header">
+                <span class="bar-label">${label}${sub ? `<span class="bar-sub">&nbsp;${sub}</span>` : ''}</span>
+                <span class="bar-pct">${pct}%</span>
               </div>
-              
-              <div class="card">
-                <h3>Family Allocation</h3>
-                ${Object.entries(familyMap).sort((a,b)=>b[1]-a[1]).map(([name, val]) => `
-                  <div class="list-item">
-                    <span>${name}</span>
-                    <strong>₹${val.toLocaleString('en-IN')}</strong>
-                  </div>
-                `).join('')}
-              </div>
+              <div class="bar-track"><div class="bar-fill" style="width:${pct}%; background:${color};"></div></div>
+              <div class="bar-amount">${fmt(value)}</div>
             </div>
+          </div>`;
+      };
 
-            <div class="card" style="margin-bottom: 40px;">
-              <h3>Bank Distribution</h3>
-              <div class="grid-2" style="margin-bottom: 0;">
-                ${Object.entries(bankMap).sort((a,b)=>b[1]-a[1]).map(([bank, val]) => `
-                  <div class="list-item">
-                    <span>${bank}</span>
-                    <strong>₹${val.toLocaleString('en-IN')}</strong>
-                  </div>
-                `).join('')}
-              </div>
-            </div>
+      const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>DepositWise Portfolio Report</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background: #f8fafc; color: #0f172a; font-size: 13px; line-height: 1.5; }
+    @media print {
+      @page { size: A4; margin: 12mm 14mm; }
+      body { background: #fff; }
+      .page { page-break-after: always; padding: 0; }
+      .page:last-child { page-break-after: avoid; }
+    }
+    .page { padding: 32px 36px 40px; min-height: 100vh; background: #fff; }
+    .hero { background: #0E0F0C; border-radius: 16px; padding: 28px 32px 24px; margin-bottom: 24px; color: #fff; }
+    .hero-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+    .hero-logo { width: 36px; height: 36px; background: rgba(255,255,255,0.15); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
+    .hero-title { font-size: 18px; font-weight: 700; color: #fff; }
+    .hero-subtitle { font-size: 12px; color: rgba(255,255,255,0.55); margin-top: 1px; }
+    .hero-amount { font-size: 36px; font-weight: 800; letter-spacing: -1px; margin-bottom: 6px; }
+    .hero-label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: rgba(255,255,255,0.55); margin-bottom: 20px; }
+    .hero-stats { display: flex; gap: 0; border-top: 1px solid rgba(255,255,255,0.12); padding-top: 18px; }
+    .hero-stat { flex: 1; text-align: center; }
+    .hero-stat + .hero-stat { border-left: 1px solid rgba(255,255,255,0.12); }
+    .hero-stat-label { font-size: 10px; color: rgba(255,255,255,0.5); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+    .hero-stat-value { font-size: 16px; font-weight: 700; color: #fff; }
+    .green-text { color: #86efac !important; }
+    .metrics-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 22px; }
+    .metric-card { background: #fff; border: 1px solid #D7FE47; border-radius: 12px; padding: 14px 16px; border-left-width: 1px; }
+    .metric-card.active-deposits { background: #FF5A1F; border-color: #E04A10; }
+    .metric-card.active-deposits .metric-label, .metric-card.active-deposits .metric-sub { color: rgba(255,255,255,0.9); }
+    .metric-card.active-deposits .metric-value { color: #fff; }
+    .metric-card.rd-flow { background: #0E0F0C; border-color: #2C2D2A; }
+    .metric-card.rd-flow .metric-label, .metric-card.rd-flow .metric-sub { color: #B0AFA8; }
+    .metric-card.rd-flow .metric-value { color: #fff; }
+    .metric-label { font-size: 10px; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; }
+    .metric-value { font-size: 20px; font-weight: 800; color: #0f172a; letter-spacing: -0.5px; }
+    .metric-sub { font-size: 10px; color: #94a3b8; margin-top: 3px; }
+    .section-title { font-size: 14px; font-weight: 700; color: #0f172a; margin-bottom: 3px; }
+    .section-sub { font-size: 11px; color: #94a3b8; margin-bottom: 14px; }
+    .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 18px 20px; margin-bottom: 16px; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 16px; }
+    .bar-item { margin-bottom: 14px; }
+    .bar-item:last-child { margin-bottom: 0; }
+    .bar-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px; }
+    .bar-label { font-size: 12px; font-weight: 600; color: #1e293b; }
+    .bar-sub { font-size: 10px; font-weight: 400; color: #94a3b8; }
+    .bar-pct { font-size: 12px; font-weight: 700; color: #0f172a; }
+    .bar-track { height: 7px; background: #f1f5f9; border-radius: 4px; overflow: hidden; margin-bottom: 3px; }
+    .bar-fill { height: 7px; border-radius: 4px; }
+    .bar-amount { font-size: 10px; color: #64748b; }
+    .product-badge { width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; margin-top: 2px; }
+    .bank-dot { width: 10px; height: 10px; border-radius: 5px; margin-top: 5px; }
+    .avatar-circle { width: 30px; height: 30px; border-radius: 15px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; margin-top: 2px; }
+    .page1-title { font-size: 22px; font-weight: 800; color: #0f172a; letter-spacing: -0.5px; margin-bottom: 4px; }
+    .page1-date { font-size: 12px; color: #94a3b8; margin-bottom: 20px; }
+    .page1-badges { margin-bottom: 8px; }
+    .page1-badge { background: #f0f4ff; border: 1px solid #c7d2fe; color: #4f46e5; font-size: 10px; font-weight: 700; padding: 3px 9px; border-radius: 20px; display: inline-block; margin-right: 6px; }
+    .page1-badge.green { background: #f0fdf4; border-color: #bbf7d0; color: #15803d; }
+    table { width: 100%; border-collapse: collapse; border-radius: 14px; overflow: hidden; border: 1px solid #e2e8f0; }
+    thead tr { background: #0E0F0C; }
+    th { color: #fff; text-align: left; padding: 11px 13px; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+    tbody tr { border-bottom: 1px solid #f1f5f9; }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:nth-child(even) { background: #fafbff; }
+    td { padding: 10px 13px; vertical-align: top; }
+    .td-name { font-weight: 700; color: #0f172a; font-size: 12px; }
+    .td-bank { font-size: 10px; color: #64748b; margin-top: 2px; }
+    .badge { display: inline-block; padding: 2px 7px; border-radius: 20px; font-size: 10px; font-weight: 700; }
+    .badge-fd { background: #f3e8ff; color: #8b5cf6; }
+    .badge-rd { background: #FFE8DF; color: #FF5A1F; }
+    .td-amount { font-weight: 700; color: #0f172a; font-size: 12px; }
+    .td-maturity { color: #10b981; font-weight: 700; font-size: 12px; }
+    .td-rate { color: #8b5cf6; font-weight: 700; font-size: 12px; }
+    .td-date { color: #475569; font-size: 11px; }
+    .td-holder { font-size: 11px; color: #475569; }
+    .table-summary td { font-weight: 700; color: #0E0F0C; font-size: 12px; padding: 12px 13px; border-top: 2px solid #0E0F0C !important; background: #f8fafc; }
+    .footer { text-align: center; color: #cbd5e1; font-size: 10px; margin-top: 28px; padding-top: 14px; border-top: 1px solid #f1f5f9; }
+  </style>
+</head>
+<body>
 
-            <div class="page-break"></div>
-            
-            <h2>2. Detailed Deposit Schedule</h2>
-            <table>
-              <thead>
-                <tr>
-                  <th>Name / Bank</th>
-                  <th>Type</th>
-                  <th>Holder</th>
-                  <th>Principal / Installment</th>
-                  <th>Rate</th>
-                  <th>Maturity Amount</th>
-                  <th>Maturity Date</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${active.map(d => {
-                  const isRD = d.type === 'RD';
-                  const installment = isRD && d.tenure_months > 0 ? d.principal_amount / d.tenure_months : 0;
-                  return `
-                  <tr>
-                    <td>
-                      <strong>${d.name}</strong>
-                      <span class="muted">${d.bank}</span>
-                    </td>
-                    <td><span class="badge ${d.type.toLowerCase()}">${d.type}</span></td>
-                    <td>${d.family_member_name}</td>
-                    <td>
-                      ₹${d.principal_amount.toLocaleString('en-IN')}
-                      ${isRD ? `<span class="muted">₹${Math.round(installment).toLocaleString('en-IN')}/mo</span>` : ''}
-                    </td>
-                    <td>${d.interest_rate}%</td>
-                    <td>₹${(d.maturity_amount || d.principal_amount).toLocaleString('en-IN')}</td>
-                    <td>${d.maturity_date ? new Date(d.maturity_date).toLocaleDateString('en-IN', { month: 'short', year: 'numeric', day: 'numeric' }) : '-'}</td>
-                  </tr>
-                  `;
-                }).join('')}
-              </tbody>
-            </table>
-            
-            <script>
-              window.onload = function() {
-                window.print();
-              };
-            </script>
-          </body>
-        </html>
-      `;
+<!-- PAGE 1 — DEPOSIT SCHEDULE -->
+<div class="page">
+  <div class="page1-badges">
+    <span class="page1-badge">Page 1 of 2</span>
+    <span class="page1-badge green">${active.length} Active Deposits</span>
+  </div>
+  <div class="page1-title">Deposit Schedule</div>
+  <div class="page1-date">DepositWise Portfolio Report &nbsp;·&nbsp; Generated ${new Date().toLocaleDateString('en-IN', { dateStyle: 'long' })}</div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Deposit Name</th>
+        <th>Type</th>
+        <th>Holder</th>
+        <th>Start Date</th>
+        <th>Tenure</th>
+        <th>Principal</th>
+        <th>Rate</th>
+        <th>Maturity Value</th>
+        <th>Maturity Date</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${active.map((d, i) => {
+        const isRD = d.type === 'RD';
+        const installment = isRD && d.tenure_months > 0 ? Math.round(d.principal_amount / d.tenure_months) : 0;
+        const matDate = d.maturity_date ? new Date(d.maturity_date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '—';
+        const startDate = d.start_date ? new Date(d.start_date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '—';
+        
+        let tenureStr = '—';
+        if (d.start_date && d.maturity_date) {
+          const start = new Date(d.start_date);
+          const end = new Date(d.maturity_date);
+          const months = Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24 * 30.44));
+          if (months >= 12) {
+            const yrs = Math.floor(months / 12);
+            const mos = months % 12;
+            tenureStr = mos > 0 ? `${yrs}y ${mos}m` : `${yrs} yr`;
+          } else {
+            tenureStr = `${months} mo`;
+          }
+        } else if (d.tenure_months) {
+          tenureStr = `${d.tenure_months} mo`;
+        }
+
+        return `
+      <tr>
+        <td style="color:#94a3b8; font-size:10px; font-weight:600;">${i + 1}</td>
+        <td><div class="td-name">${d.name}</div><div class="td-bank">${d.bank}</div></td>
+        <td><span class="badge ${d.type === 'FD' ? 'badge-fd' : 'badge-rd'}">${d.type}</span></td>
+        <td class="td-holder">${d.family_member_name}</td>
+        <td class="td-date">${startDate}</td>
+        <td class="td-date">${tenureStr}</td>
+        <td><div class="td-amount">${fmt(d.principal_amount)}</div>${isRD ? `<div class="td-bank">${fmt(installment)}/mo</div>` : ''}</td>
+        <td class="td-rate">${d.interest_rate}%</td>
+        <td class="td-maturity">${fmt(d.maturity_amount || d.principal_amount)}</td>
+        <td class="td-date">${matDate}</td>
+      </tr>`;
+      }).join('')}
+      <tr class="table-summary">
+        <td colspan="6" style="text-align:right; color:#8b5cf6; font-size:11px;">PORTFOLIO TOTAL</td>
+        <td>${fmt(totalInvested)}</td>
+        <td style="color:#94a3b8; font-size:11px;">${blendedYield.toFixed(2)}% avg</td>
+        <td>${fmt(totalMaturity)}</td>
+        <td></td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="footer">DepositWise &nbsp;·&nbsp; Your personal fixed deposit tracker &nbsp;·&nbsp; Continued on Page 2 →</div>
+</div>
+
+<!-- PAGE 2 — ANALYTICS -->
+<div class="page">
+  <div class="hero">
+    <div class="hero-brand">
+      <div class="hero-logo">📊</div>
+      <div>
+        <div class="hero-title">Portfolio Analytics</div>
+        <div class="hero-subtitle">DepositWise &nbsp;·&nbsp; ${new Date().toLocaleDateString('en-IN', { dateStyle: 'long' })}</div>
+      </div>
+    </div>
+    <div class="hero-label">Total Portfolio Value</div>
+    <div class="hero-amount">${fmt(totalMaturity)}</div>
+    <div class="hero-stats">
+      <div class="hero-stat">
+        <div class="hero-stat-label">Invested</div>
+        <div class="hero-stat-value">${fmt(totalInvested)}</div>
+      </div>
+      <div class="hero-stat">
+        <div class="hero-stat-label">Interest Earned</div>
+        <div class="hero-stat-value green-text">${fmt(totalInterest)}</div>
+      </div>
+      <div class="hero-stat">
+        <div class="hero-stat-label">Overall Gain</div>
+        <div class="hero-stat-value green-text">+${overallGainPct}%</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="metrics-row">
+    <div class="metric-card">
+      <div class="metric-label">Blended Yield</div>
+      <div class="metric-value">${blendedYield.toFixed(2)}%</div>
+      <div class="metric-sub">Weighted avg rate p.a.</div>
+    </div>
+    <div class="metric-card active-deposits">
+      <div class="metric-label">Active Deposits</div>
+      <div class="metric-value">${active.length}</div>
+      <div class="metric-sub">${fdCount} FD &nbsp;·&nbsp; ${rdCount} RD</div>
+    </div>
+    <div class="metric-card rd-flow">
+      <div class="metric-label">RD Monthly Flow</div>
+      <div class="metric-value">${fmt(Math.round(totalRDMonthly))}</div>
+      <div class="metric-sub">Cash flow required</div>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <div class="section-title">Product Mix</div>
+      <div class="section-sub">FD vs RD by maturity value</div>
+      ${fdValue > 0 ? barRow('Fixed Deposits', fdValue, totalMaturity, '#0E0F0C', `${fdCount} deposits`, `<div class="product-badge" style="background:#D7FE47; color:#0E0F0C;">FD</div>`) : ''}
+      ${rdValue > 0 ? barRow('Recurring Deposits', rdValue, totalMaturity, '#0E0F0C', `${rdCount} deposits`, `<div class="product-badge" style="background:#FF5A1F; color:#fff;">RD</div>`) : ''}
+    </div>
+    <div class="card">
+      <div class="section-title">Family Allocation</div>
+      <div class="section-sub">Wealth distributed by member</div>
+      ${familyEntries.map(([name, val], i) => {
+         const color = CHART_COLORS[i % CHART_COLORS.length];
+         const badgeHtml = `<div class="avatar-circle" style="background:${color}22; color:${color}">${name.charAt(0).toUpperCase()}</div>`;
+         return barRow(name, val, totalMaturity, color, undefined, badgeHtml);
+      }).join('')}
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Bank Distribution</div>
+    <div class="section-sub">Maturity value by institution</div>
+    <div class="grid-2" style="margin-bottom:0;">
+      ${bankEntries.map(([bank, val], i) => {
+         const color = CHART_COLORS[i % CHART_COLORS.length];
+         const badgeHtml = `<div class="bank-dot" style="background:${color};"></div>`;
+         return barRow(bank, val, totalMaturity, color, undefined, badgeHtml);
+      }).join('')}
+    </div>
+  </div>
+
+  <div class="footer">DepositWise &nbsp;·&nbsp; Your personal fixed deposit tracker &nbsp;·&nbsp; This report is auto-generated and for reference only.</div>
+</div>
+
+</body>
+</html>`;
 
       if (Platform.OS === 'web') {
         const printWindow = window.open('', '_blank');
@@ -464,7 +635,6 @@ export default function SettingsScreen() {
           Alert.alert('Popup Blocked', 'Please allow popups to export your PDF report.');
           return;
         }
-
         printWindow.document.open();
         printWindow.document.write(html);
         printWindow.document.close();
@@ -476,6 +646,7 @@ export default function SettingsScreen() {
       Alert.alert('Error', 'Failed to export to PDF: ' + err.message);
     }
   };
+
 
   return (
     <ScrollView
@@ -504,8 +675,8 @@ export default function SettingsScreen() {
           </View>
           <SettingsRow
             Icon={LogOut}
-            iconColor={colors.lavender}
-            iconBg={colors.lavenderSoft}
+            iconColor="#b91c1c"
+            iconBg="#fee2e2"
             label="Sign Out"
             onPress={handleSignOut}
             isLast
@@ -517,31 +688,25 @@ export default function SettingsScreen() {
         {!isSignedIn ? (
           <SettingsRow
             Icon={CloudUpload}
-            iconColor={colors.text1}
-            iconBg={colors.mint}
+            iconColor={colors.text3}
+            iconBg={colors.bgBase}
             label="Sign in to Google Drive"
             onPress={handleGoogleSignIn}
           />
         ) : (
           <SettingsRow
             Icon={CloudUpload}
-            iconColor={colors.text1}
-            iconBg={colors.mint}
+            iconColor={colors.text3}
+            iconBg={colors.bgBase}
             label={backingUp ? "Syncing..." : "Sync with Google Drive"}
             onPress={handleManualSync}
           />
         )}
-        <SettingsRow
-          Icon={HardDrive}
-          iconColor={colors.text1}
-          iconBg={colors.mint}
-          label="Local Backup (JSON)"
-          onPress={handleLocalBackup}
-        />
+
         <SettingsRow
           Icon={Trash2}
-          iconColor={colors.lavender}
-          iconBg={colors.lavenderSoft}
+          iconColor="#b91c1c"
+          iconBg="#fee2e2"
           label="Clear All Data"
           onPress={handleClearData}
           isLast
@@ -551,8 +716,8 @@ export default function SettingsScreen() {
       <SettingsSection title="Export">
         <SettingsRow
           Icon={FileSpreadsheet}
-          iconColor={colors.text1}
-          iconBg={colors.mint}
+          iconColor="#15803d"
+          iconBg="#dcfce7"
           label="Export to Excel"
           onPress={handleExcelExport}
         />
@@ -569,16 +734,16 @@ export default function SettingsScreen() {
       <SettingsSection title="Notifications">
         <SettingsToggleRow
           Icon={Bell}
-          iconColor={colors.text1}
-          iconBg={colors.mint}
+          iconColor="#b45309"
+          iconBg="#fef3c7"
           label="Maturity Reminders"
           value={toggles.maturityReminders}
           onToggle={() => toggle('maturityReminders')}
         />
         <SettingsToggleRow
           Icon={Bell}
-          iconColor={colors.lavender}
-          iconBg={colors.lavenderSoft}
+          iconColor="#b45309"
+          iconBg="#fef3c7"
           label="RD Installment Reminders"
           value={toggles.rdInstallmentReminders}
           onToggle={() => toggle('rdInstallmentReminders')}
@@ -590,12 +755,12 @@ export default function SettingsScreen() {
       <SettingsSection title="Security">
         <SettingsToggleRow
           Icon={Lock}
-          iconColor={colors.lavender}
-          iconBg={colors.lavenderSoft}
+          iconColor={toggles.appLock ? '#6366f1' : colors.text3}
+          iconBg={toggles.appLock ? '#ede9fe' : colors.bgBase}
           label="App Lock"
-          description="Biometric / PIN authentication"
+          description="Require fingerprint / PIN on open"
           value={toggles.appLock}
-          onToggle={() => toggle('appLock')}
+          onToggle={handleAppLockToggle}
           isLast
         />
       </SettingsSection>
@@ -607,7 +772,7 @@ export default function SettingsScreen() {
           iconBg={colors.bgBase}
           label="DepositWise"
           value="v1.0.0"
-          onPress={() => {}}
+          onPress={() => { }}
         />
         <View style={[styles.row, { borderBottomWidth: 0, paddingVertical: 14 }]}>
           <Text style={styles.aboutText}>
@@ -665,12 +830,10 @@ function SettingsToggleRow({
         <Text style={styles.rowLabel}>{label}</Text>
         {description && <Text style={styles.rowDesc}>{description}</Text>}
       </View>
-      <Switch
+      <IOSSwitch
         value={value}
         onValueChange={onToggle}
-        trackColor={{ false: colors.bgTertiary, true: '#22863a' }}
-        thumbColor={colors.white}
-        {...({ activeThumbColor: colors.white } as any)}
+        activeColor="#22863a"
       />
     </View>
   );

@@ -9,18 +9,18 @@ import {
   ActivityIndicator,
   TextInput,
   Modal,
-  FlatList,
   DeviceEventEmitter,
   Animated,
+  FlatList,
 } from 'react-native';
+import { KeyboardAwareScrollView } from 'react-native-keyboard-aware-scroll-view';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useRouter, useFocusEffect } from 'expo-router';
-import { Search, Plus, ChevronDown, TrendingUp, Check, SlidersHorizontal } from 'lucide-react-native';
+import { useRouter, useFocusEffect, useLocalSearchParams } from 'expo-router';
+import { Search, Plus, ChevronDown, TrendingUp, Check, SlidersHorizontal, Lock, X } from 'lucide-react-native';
 import { colors, radius, shadows, typography } from '@/constants/theme';
 import { getDeposits, Deposit, getFamilyMembers } from '@/lib/storage';
-import { formatCurrencyFull, getMaturityLabel, getDaysUntilMaturity } from '@/lib/calculations';
+import { formatCurrencyFull, formatMaturityDate, getMaturityLabel, getDaysUntilMaturity } from '@/lib/calculations';
 
-const TYPE_FILTERS = ['All', 'FD', 'RD', 'Matured', 'Closed'];
 const SORT_OPTIONS = ['Maturity Date', 'Principal: High to Low', 'Principal: Low to High', 'Interest Rate: High to Low'];
 
 function FilterModal({
@@ -86,16 +86,39 @@ function FilterModal({
 export default function DepositsScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
+  const params = useLocalSearchParams();
   const [deposits, setDeposits] = useState<Deposit[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [activeFilter, setActiveFilter] = useState('All');
+  const [statusFilter, setStatusFilter] = useState<'Active' | 'Matured' | 'Closed'>('Active');
+  const [typeFilter, setTypeFilter] = useState<'All' | 'FD' | 'RD'>((params.typeFilter as any) || 'All');
   const [searchQuery, setSearchQuery] = useState('');
   const [showSearch, setShowSearch] = useState(false);
 
-  const [selectedBank, setSelectedBank] = useState('All Banks');
-  const [selectedMember, setSelectedMember] = useState('All Members');
+  const [selectedBank, setSelectedBank] = useState((params.bankFilter as string) || 'All Banks');
+  const [selectedMember, setSelectedMember] = useState((params.memberFilter as string) || 'All Members');
   const [selectedSort, setSelectedSort] = useState('Maturity Date');
+
+  useEffect(() => {
+    // When navigating from analytics, only one filter param is sent at a time.
+    // Clear all other filters first so they don't stack up.
+    if (params.typeFilter) {
+      setTypeFilter(params.typeFilter as any);
+      setSelectedBank('All Banks');
+      setSelectedMember('All Members');
+      setSearchQuery('');
+    } else if (params.bankFilter) {
+      setSelectedBank(params.bankFilter as string);
+      setTypeFilter('All');
+      setSelectedMember('All Members');
+      setSearchQuery('');
+    } else if (params.memberFilter) {
+      setSelectedMember(params.memberFilter as string);
+      setTypeFilter('All');
+      setSelectedBank('All Banks');
+      setSearchQuery('');
+    }
+  }, [params.typeFilter, params.bankFilter, params.memberFilter]);
 
   const [banksList, setBanksList] = useState<string[]>([]);
   const [membersList, setMembersList] = useState<string[]>([]);
@@ -140,12 +163,16 @@ export default function DepositsScreen() {
     const isMatured = d.status === 'matured' || label === 'Matured';
     const isClosed = d.status === 'closed' || label === 'Closed';
 
-    const matchFilter =
-      (activeFilter === 'All' && !isClosed) ||
-      (activeFilter === 'FD' && d.type === 'FD' && !isClosed) ||
-      (activeFilter === 'RD' && d.type === 'RD' && !isClosed) ||
-      (activeFilter === 'Matured' && isMatured && !isClosed) ||
-      (activeFilter === 'Closed' && isClosed);
+    let matchStatus = false;
+    if (statusFilter === 'Active') {
+      matchStatus = !isMatured && !isClosed;
+    } else if (statusFilter === 'Matured') {
+      matchStatus = isMatured && !isClosed;
+    } else if (statusFilter === 'Closed') {
+      matchStatus = isClosed;
+    }
+
+    const matchType = typeFilter === 'All' || d.type === typeFilter;
 
     const matchSearch =
       !searchQuery ||
@@ -156,28 +183,51 @@ export default function DepositsScreen() {
     const matchBank = selectedBank === 'All Banks' || d.bank === selectedBank;
     const matchMember = selectedMember === 'All Members' || d.family_member_name === selectedMember;
 
-    return matchFilter && matchSearch && matchBank && matchMember;
+    return matchStatus && matchType && matchSearch && matchBank && matchMember;
   });
 
   const sorted = [...filtered].sort((a, b) => {
-    if (selectedSort === 'Maturity Date') {
+    if (selectedSort.startsWith('Maturity')) {
       if (!a.maturity_date) return 1;
       if (!b.maturity_date) return -1;
       return new Date(a.maturity_date).getTime() - new Date(b.maturity_date).getTime();
     }
-    if (selectedSort === 'Principal: High to Low') {
-      return b.principal_amount - a.principal_amount;
-    }
-    if (selectedSort === 'Principal: Low to High') {
-      return a.principal_amount - b.principal_amount;
-    }
-    if (selectedSort === 'Interest Rate: High to Low') {
-      return b.interest_rate - a.interest_rate;
-    }
+    if (selectedSort === 'Principal: High to Low') return b.principal_amount - a.principal_amount;
+    if (selectedSort === 'Principal: Low to High') return a.principal_amount - b.principal_amount;
+    if (selectedSort === 'Interest Rate: High to Low') return b.interest_rate - a.interest_rate;
     return 0;
   });
 
+  let emptyTitle = 'No deposits found';
+  let emptyDesc = 'Tap + to add your first deposit';
+
+  if (searchQuery || typeFilter !== 'All' || selectedBank !== 'All Banks' || selectedMember !== 'All Members') {
+    emptyTitle = 'No matches found';
+    emptyDesc = 'Try adjusting your filters or search query';
+  } else if (statusFilter === 'Active') {
+    emptyTitle = 'No active deposits';
+    emptyDesc = 'Tap + to add your first deposit';
+  } else if (statusFilter === 'Matured') {
+    emptyTitle = 'No matured deposits';
+    emptyDesc = 'Wait until your active deposits reach maturity';
+  } else if (statusFilter === 'Closed') {
+    emptyTitle = 'No closed deposits';
+    emptyDesc = 'Matured deposits that you have closed will appear here';
+  }
+
   const totalValue = filtered.reduce((sum, d) => sum + (d.maturity_amount || d.principal_amount), 0);
+
+  const hasFilters = typeFilter !== 'All' || selectedBank !== 'All Banks' || selectedMember !== 'All Members' || searchQuery !== '';
+
+  const clearFilters = () => {
+    setTypeFilter('All');
+    setSelectedBank('All Banks');
+    setSelectedMember('All Members');
+    setSearchQuery('');
+    setStatusFilter('Active');
+    setSelectedSort('Maturity Date');
+    router.setParams({ typeFilter: '', bankFilter: '', memberFilter: '' });
+  };
 
   if (loading) {
     return (
@@ -223,62 +273,82 @@ export default function DepositsScreen() {
           </View>
         )}
 
-        {/* Type Filter Chips */}
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.filtersRow}
-        >
-          {TYPE_FILTERS.map(f => (
+        {/* Status Navigation Bar */}
+        <View style={styles.statusBar}>
+          {['Active', 'Matured', 'Closed'].map(status => (
             <TouchableOpacity
-              key={f}
-              style={[styles.filterChip, activeFilter === f && styles.filterChipActive]}
-              onPress={() => setActiveFilter(f)}
+              key={status}
+              style={[styles.statusTab, statusFilter === status && styles.statusTabActive]}
+              onPress={() => setStatusFilter(status as any)}
             >
-              <Text style={[styles.filterChipText, activeFilter === f && styles.filterChipTextActive]}>{f}</Text>
+              <Text style={[styles.statusTabText, statusFilter === status && styles.statusTabTextActive]}>{status}</Text>
             </TouchableOpacity>
           ))}
-        </ScrollView>
+        </View>
+
+        {/* Type Navigation Bar */}
+        <View style={styles.statusBar}>
+          {['All', 'FD', 'RD'].map(type => (
+            <TouchableOpacity
+              key={type}
+              style={[styles.statusTab, typeFilter === type && styles.statusTabActive]}
+              onPress={() => setTypeFilter(type as any)}
+            >
+              <Text style={[styles.statusTabText, typeFilter === type && styles.statusTabTextActive]}>
+                {type === 'All' ? 'All Types' : type === 'FD' ? 'FD' : 'RD'}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
 
         {/* Sort/Filter Dropdowns */}
         <ScrollView
           horizontal
           showsHorizontalScrollIndicator={false}
-          contentContainerStyle={[styles.filtersRow, { marginTop: 8, paddingBottom: 4 }]}
+          contentContainerStyle={[styles.filtersRow, { marginTop: 12, paddingBottom: 4 }]}
         >
+          {hasFilters && (
+            <TouchableOpacity style={styles.clearFilterBtn} onPress={clearFilters}>
+              <X size={12} color={colors.text2} />
+              <Text style={styles.clearFilterText}>Clear</Text>
+            </TouchableOpacity>
+          )}
           <TouchableOpacity style={styles.dropdownSelector} onPress={() => setSortModalVisible(true)}>
             <SlidersHorizontal size={12} color={colors.text3} />
-            <Text style={styles.dropdownSelectorText}>{selectedSort.split(':')[0]}</Text>
+            <Text style={styles.dropdownSelectorText}>Sort: {selectedSort.split(':')[0]}</Text>
             <ChevronDown size={12} color={colors.text3} />
           </TouchableOpacity>
           <TouchableOpacity style={styles.dropdownSelector} onPress={() => setBankModalVisible(true)}>
-            <Text style={styles.dropdownSelectorText}>{selectedBank}</Text>
+            <Text style={styles.dropdownSelectorText}>Bank: {selectedBank === 'All Banks' ? 'All' : selectedBank}</Text>
             <ChevronDown size={12} color={colors.text3} />
           </TouchableOpacity>
           <TouchableOpacity style={styles.dropdownSelector} onPress={() => setMemberModalVisible(true)}>
-            <Text style={styles.dropdownSelectorText}>{selectedMember}</Text>
+            <Text style={styles.dropdownSelectorText}>Member: {selectedMember === 'All Members' ? 'All' : selectedMember}</Text>
             <ChevronDown size={12} color={colors.text3} />
           </TouchableOpacity>
         </ScrollView>
       </View>
 
-      <ScrollView
+      <KeyboardAwareScrollView
         contentContainerStyle={styles.list}
         showsVerticalScrollIndicator={false}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.text1} />}
+        enableOnAndroid={true}
+        keyboardShouldPersistTaps="handled"
+        extraScrollHeight={20}
       >
         {sorted.length === 0 ? (
           <View style={styles.emptyState}>
             <View style={styles.emptyIconWrap}>
               <TrendingUp size={28} color={colors.text3} />
             </View>
-            <Text style={styles.emptyTitle}>No deposits found</Text>
-            <Text style={styles.emptyDesc}>Tap + to add your first deposit</Text>
+            <Text style={styles.emptyTitle}>{emptyTitle}</Text>
+            <Text style={styles.emptyDesc}>{emptyDesc}</Text>
           </View>
         ) : (
           sorted.map(deposit => <DepositCard key={deposit.id} deposit={deposit} onPress={() => router.push(`/deposit/${deposit.id}` as any)} />)
         )}
-      </ScrollView>
+      </KeyboardAwareScrollView>
 
       <FilterModal
         visible={sortModalVisible}
@@ -324,8 +394,8 @@ function DepositCard({ deposit, onPress }: { deposit: Deposit; onPress: () => vo
     accentColor = '#b45309';
     accentSoft = colors.goldSoft;
   } else if (isClosed) {
-    accentColor = colors.lavender;
-    accentSoft = colors.lavenderSoft;
+    accentColor = '#b91c1c';
+    accentSoft = '#fee2e2';
   }
 
   return (
@@ -357,6 +427,11 @@ function DepositCard({ deposit, onPress }: { deposit: Deposit; onPress: () => vo
           <Text style={styles.metaText}>{deposit.interest_rate}% p.a.</Text>
           <Text style={styles.metaDot}>•</Text>
           <Text style={styles.metaText}>Principal: {formatCurrencyFull(deposit.principal_amount)}</Text>
+        </View>
+        <View style={styles.cardMeta}>
+          <Text style={[styles.metaText, { color: isAboutToMature ? '#b45309' : isMatured ? colors.text3 : colors.text3 }]}>
+            {isMatured ? 'Matured' : isClosed ? 'Closed'  : 'Matures'}: {formatMaturityDate(deposit.maturity_date)}
+          </Text>
         </View>
       </View>
     </TouchableOpacity>
@@ -406,19 +481,86 @@ const styles = StyleSheet.create({
     borderColor: colors.separator,
   },
   searchInput: { flex: 1, fontSize: 14, color: colors.text1, fontFamily: typography.regular, outlineStyle: 'none' as any },
-  filtersRow: { gap: 8, paddingRight: 20 },
-  filterChip: {
-    paddingHorizontal: 16,
-    paddingVertical: 7,
-    borderRadius: radius.pill,
+  statusBar: {
+    flexDirection: 'row',
     backgroundColor: colors.bgElevated,
+    borderRadius: radius.md,
+    padding: 4,
+    marginBottom: 16,
     borderWidth: 1,
     borderColor: colors.separator,
   },
-  filterChipActive: { backgroundColor: colors.text1, borderColor: colors.text1 },
-  filterChipText: { fontSize: 13, fontFamily: typography.semiBold, color: colors.text3 },
-  filterChipTextActive: { color: colors.white },
+  statusTab: {
+    flex: 1,
+    paddingVertical: 8,
+    alignItems: 'center',
+    borderRadius: radius.sm,
+  },
+  statusTabActive: {
+    backgroundColor: colors.text1,
+  },
+  statusTabText: {
+    fontSize: 13,
+    fontFamily: typography.semiBold,
+    color: colors.text3,
+    textAlign: 'center',
+  },
+  statusTabTextActive: {
+    color: colors.white,
+  },
 
+  typeCardsRow: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  typeCard: {
+    flex: 1,
+    backgroundColor: colors.bgElevated,
+    borderRadius: radius.card,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: colors.separator,
+    alignItems: 'flex-start',
+    gap: 8,
+  },
+  typeCardActive: {
+    borderColor: colors.text1,
+    backgroundColor: '#FAFAFA',
+  },
+  typeCardIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: radius.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  typeCardText: {
+    fontSize: 13,
+    fontFamily: typography.semiBold,
+    color: colors.text2,
+  },
+  typeCardTextActive: {
+    color: colors.text1,
+    fontFamily: typography.bold,
+  },
+
+  filtersRow: { gap: 8, paddingRight: 20 },
+  clearFilterBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: colors.bgBase,
+    borderWidth: 1,
+    borderColor: colors.separator,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: radius.pill,
+    gap: 4,
+  },
+  clearFilterText: {
+    fontSize: 13,
+    fontFamily: typography.semiBold,
+    color: colors.text2,
+  },
   dropdownSelector: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -428,12 +570,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 7,
     borderRadius: radius.pill,
-    gap: 5,
+    gap: 6,
   },
   dropdownSelectorText: {
-    fontSize: 12,
+    fontSize: 13,
     fontFamily: typography.semiBold,
-    color: colors.text2,
+    color: colors.text1,
   },
 
   list: { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 120, gap: 10 },
